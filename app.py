@@ -181,7 +181,7 @@ def collect_visible_text_with_scroll(driver, scroll_count=5):
     return "\n".join(texts)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=3600)
 def get_naver_place_data(url):
     driver = make_driver()
 
