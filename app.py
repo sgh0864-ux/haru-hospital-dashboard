@@ -1,695 +1,414 @@
-import subprocess
-import sys
-
-try:
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-except Exception:
-    pass
-
-import re
-import sqlite3
-from datetime import datetime, timedelta
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+import re
+import time
+from datetime import datetime
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
-st.set_page_config(page_title="하루한의원 리뷰 대시보드", layout="wide")
-
-
-# ======================================================
-# CSS
-# ======================================================
+st.set_page_config(
+    page_title="하루한의원 리뷰 눈팅",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
-.stApp {
-    background: radial-gradient(circle at top left, #1f2937 0, #0b1020 38%, #060914 100%);
-    color: #e5e7eb;
-}
-.block-container {
-    max-width: 1280px;
-    padding-top: 36px;
-    padding-bottom: 80px;
-}
+.stApp { background-color: #0f1117; color: white; }
+.block-container { max-width: 1350px; padding-top: 35px; padding-bottom: 80px; }
+
 html, body, [class*="css"] {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: white;
 }
-.badge {
-    display: inline-block;
-    padding: 7px 12px;
-    border-radius: 999px;
-    background: rgba(59,130,246,.14);
-    color: #93c5fd;
-    font-size: 13px;
-    font-weight: 700;
-    margin-bottom: 14px;
-}
-.main-title {
-    font-size: 42px;
-    font-weight: 850;
-    letter-spacing: -1.3px;
-    color: #f9fafb;
-    margin-bottom: 10px;
-}
-.main-sub {
-    color: #9ca3af;
-    font-size: 16px;
-    margin-bottom: 28px;
-}
-.section-title {
-    margin-top: 34px;
-    margin-bottom: 14px;
-    font-size: 21px;
-    font-weight: 850;
-    color: #f9fafb;
-}
-.card, .kpi-card {
-    background: rgba(17,24,39,.82);
-    border: 1px solid rgba(255,255,255,.08);
-    border-radius: 22px;
-    box-shadow: 0 16px 38px rgba(0,0,0,.28);
-}
-.card {
-    padding: 22px;
-}
+
+.main-title { font-size: 48px; font-weight: 800; color: white; margin-bottom: 10px; }
+.main-sub { color: #9ca3af; font-size: 17px; margin-bottom: 45px; }
+
 .kpi-card {
-    padding: 22px;
-    min-height: 132px;
-}
-.kpi-label {
-    color: #9ca3af;
-    font-size: 13px;
-    font-weight: 750;
-    margin-bottom: 14px;
-}
-.kpi-value {
-    color: #f9fafb;
-    font-size: 32px;
-    line-height: 1;
-    font-weight: 850;
-    letter-spacing: -1px;
-}
-.kpi-help {
-    color: #6b7280;
-    font-size: 13px;
-    margin-top: 13px;
-}
-.insight-card {
-    background: linear-gradient(135deg, rgba(37,99,235,.25), rgba(17,24,39,.9));
-    border: 1px solid rgba(147,197,253,.22);
+    background: #171b26;
     border-radius: 24px;
     padding: 26px;
-    box-shadow: 0 18px 45px rgba(0,0,0,.28);
+    border: 1px solid #262b36;
+    min-height: 150px;
 }
-.insight-title {
-    color: #f9fafb;
-    font-size: 22px;
-    font-weight: 850;
-    margin-bottom: 12px;
+
+.kpi-title { color: #9ca3af; font-size: 14px; font-weight: 600; margin-bottom: 16px; }
+.kpi-value { color: white; font-size: 38px; font-weight: 800; line-height: 1; }
+.kpi-desc { margin-top: 14px; color: #9ca3af; font-size: 13px; line-height: 1.5; }
+
+.section-title {
+    color: white;
+    font-size: 28px;
+    font-weight: 700;
+    margin-top: 55px;
+    margin-bottom: 22px;
 }
-.insight-text {
-    color: #d1d5db;
-    font-size: 15px;
-    line-height: 1.8;
+
+.content-card {
+    background: #171b26;
+    border-radius: 24px;
+    padding: 24px;
+    border: 1px solid #262b36;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ======================================================
-# SETTINGS
-# ======================================================
-
-MAIN_HOSPITAL = "하루한의원"
-DB_PATH = "naver_review_history.db"
-
-HOSPITALS = [
-    {
-        "name": "이로운 한의원",
-        "url": "https://naver.me/5WOuxbRt",
-    },
-    {
-        "name": "함소아한의원 왕십리",
-        "url": "https://naver.me/5pwZ4BWi",
-    },
-    {
-        "name": "경희본한의원",
-        "url": "https://naver.me/GyYrk7Bl",
-    },
-    {
-        "name": "하루한의원",
-        "url": "https://naver.me/xHg774HK",
-    },
-    {
-        "name": "왕십리옥토한의원",
-        "url": "https://naver.me/5CW490lL",
-    },
-]
-
-
-# ======================================================
-# DB
-# ======================================================
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS review_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hospital_name TEXT NOT NULL,
-        visitor_reviews INTEGER NOT NULL,
-        blog_reviews INTEGER NOT NULL,
-        total_reviews INTEGER NOT NULL,
-        status TEXT,
-        place_url TEXT,
-        collected_at TEXT NOT NULL
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def save_snapshot(row):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-    INSERT INTO review_snapshots (
-        hospital_name,
-        visitor_reviews,
-        blog_reviews,
-        total_reviews,
-        status,
-        place_url,
-        collected_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        row["병원명"],
-        int(row["방문자리뷰"]),
-        int(row["블로그리뷰"]),
-        int(row["총리뷰수"]),
-        row["조회상태"],
-        row.get("플레이스URL", ""),
-        row["조회시간"],
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def load_history(hospital_name):
-    conn = sqlite3.connect(DB_PATH)
-
-    history_df = pd.read_sql_query(
-        """
-        SELECT
-            hospital_name,
-            visitor_reviews,
-            blog_reviews,
-            total_reviews,
-            status,
-            place_url,
-            collected_at
-        FROM review_snapshots
-        WHERE hospital_name = ?
-        ORDER BY collected_at ASC
+def kpi_card(title, value, desc):
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-title">{title}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-desc">{desc}</div>
+        </div>
         """,
-        conn,
-        params=(hospital_name,),
+        unsafe_allow_html=True
     )
 
-    conn.close()
 
-    if not history_df.empty:
-        history_df["collected_at"] = pd.to_datetime(history_df["collected_at"])
+main_hospital = "하루한의원"
 
-    return history_df
-
-
-def get_nearest_before(history_df, target_time):
-    if history_df.empty:
-        return None
-
-    before_df = history_df[history_df["collected_at"] <= target_time]
-
-    if before_df.empty:
-        return None
-
-    return before_df.iloc[-1]
+hospital_urls = {
+    "하루한의원": "https://naver.me/xHg774HK",
+    "이로움한의원": "https://naver.me/5WOuxbRt",
+    "경희본한의원": "https://naver.me/GyYrk7Bl",
+    "왕십리옥토한의원": "https://naver.me/5CW490lL",
+    "함소아한의원 왕십리": "https://naver.me/5pwZ4BWi"
+}
 
 
-def calc_delta(history_df, current_total, days):
-    if history_df.empty:
-        return None
+def make_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1500,1300")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 
-    target_time = datetime.now() - timedelta(days=days)
-    past_row = get_nearest_before(history_df, target_time)
-
-    if past_row is None:
-        return None
-
-    return int(current_total - past_row["total_reviews"])
-
-
-def format_delta(value):
-    if value is None:
-        return "기록 부족"
-    return f"{value:+,}개"
+    return webdriver.Chrome(options=options)
 
 
-# ======================================================
-# NAVER CRAWLING
-# ======================================================
-
-def to_int(num_text):
-    if not num_text:
-        return 0
-    return int(num_text.replace(",", "").strip())
-
-
-def parse_review_counts(html):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
+def parse_total_counts(text):
     visitor = 0
     blog = 0
 
     visitor_patterns = [
-        r"방문자리뷰\s*([0-9,]+)",
-        r"방문자 리뷰\s*([0-9,]+)",
         r"방문자\s*리뷰\s*([0-9,]+)",
+        r"방문자리뷰\s*([0-9,]+)"
     ]
 
     blog_patterns = [
-        r"블로그리뷰\s*([0-9,]+)",
-        r"블로그 리뷰\s*([0-9,]+)",
         r"블로그\s*리뷰\s*([0-9,]+)",
+        r"블로그리뷰\s*([0-9,]+)"
     ]
 
     for pattern in visitor_patterns:
         match = re.search(pattern, text)
         if match:
-            visitor = to_int(match.group(1))
+            visitor = int(match.group(1).replace(",", ""))
             break
 
     for pattern in blog_patterns:
         match = re.search(pattern, text)
         if match:
-            blog = to_int(match.group(1))
+            blog = int(match.group(1).replace(",", ""))
             break
 
     return visitor, blog
 
 
-def normalize_place_url(url):
-    if "/home" in url:
-        return url
+def extract_dates(text):
+    today = datetime.now()
+    dates = []
 
-    clean_url = url.split("?")[0].rstrip("/")
+    patterns = [
+        r"(20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})",
+        r"(\d{1,2})[.\-/월\s]+(\d{1,2})[일.]?"
+    ]
 
-    if any(path in clean_url for path in ["/hospital/", "/place/", "/restaurant/", "/clinic/"]):
-        return clean_url + "/home"
+    for match in re.finditer(patterns[0], text):
+        y, m, d = match.groups()
+        dates.append((int(y), int(m), int(d)))
 
-    return url
+    for match in re.finditer(patterns[1], text):
+        m, d = match.groups()
+        dates.append((today.year, int(m), int(d)))
+
+    return dates
 
 
-def get_naver_place_review_data(hospital):
-    result = {
-        "병원명": hospital["name"],
-        "방문자리뷰": 0,
-        "블로그리뷰": 0,
-        "총리뷰수": 0,
-        "조회상태": "실패",
-        "조회시간": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "입력URL": hospital["url"],
-        "플레이스URL": "",
-    }
+def count_month_reviews(dates, year, month):
+    return sum(1 for y, m, d in dates if y == year and m == month)
+
+
+def click_review_tab(driver, keyword):
+    candidates = driver.find_elements(By.XPATH, f"//*[contains(text(), '{keyword}')]")
+
+    for el in candidates:
+        try:
+            driver.execute_script("arguments[0].click();", el)
+            time.sleep(2)
+            return True
+        except:
+            pass
+
+    return False
+
+
+def collect_visible_text_with_scroll(driver, scroll_count=5):
+    texts = []
+
+    for _ in range(scroll_count):
+        text = driver.find_element(By.TAG_NAME, "body").text
+        texts.append(text)
+
+        driver.execute_script("window.scrollBy(0, 900);")
+        time.sleep(1.2)
+
+    return "\n".join(texts)
+
+
+@st.cache_data(ttl=600)
+def get_naver_place_data(url):
+    driver = make_driver()
+
+    visitor_total = 0
+    blog_total = 0
+
+    visitor_this_month = 0
+    visitor_prev_month = 0
+    blog_this_month = 0
+    blog_prev_month = 0
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+        driver.get(url)
+
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        time.sleep(3)
+
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.frame_to_be_available_and_switch_to_it("entryIframe")
             )
+            time.sleep(2)
+        except:
+            pass
 
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                    "Version/16.0 Mobile/15E148 Safari/604.1"
-                ),
-                viewport={"width": 390, "height": 844},
-                locale="ko-KR",
-            )
+        base_text = driver.find_element(By.TAG_NAME, "body").text
+        visitor_total, blog_total = parse_total_counts(base_text)
 
-            page = context.new_page()
+        today = datetime.now()
+        this_year = today.year
+        this_month = today.month
 
-            page.goto(hospital["url"], wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
+        prev_month = this_month - 1
+        prev_year = this_year
 
-            final_url = page.url
-            place_url = normalize_place_url(final_url)
+        if prev_month == 0:
+            prev_month = 12
+            prev_year -= 1
 
-            result["플레이스URL"] = place_url
+        # 방문자 리뷰 탭
+        click_review_tab(driver, "방문자")
+        visitor_text = collect_visible_text_with_scroll(driver, scroll_count=6)
+        visitor_dates = extract_dates(visitor_text)
 
-            page.goto(place_url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(4000)
+        visitor_this_month = count_month_reviews(
+            visitor_dates,
+            this_year,
+            this_month
+        )
 
-            html = page.content()
-            visitor, blog = parse_review_counts(html)
+        visitor_prev_month = count_month_reviews(
+            visitor_dates,
+            prev_year,
+            prev_month
+        )
 
-            browser.close()
+        # 블로그 리뷰 탭
+        click_review_tab(driver, "블로그")
+        blog_text = collect_visible_text_with_scroll(driver, scroll_count=6)
+        blog_dates = extract_dates(blog_text)
 
-            result["방문자리뷰"] = visitor
-            result["블로그리뷰"] = blog
-            result["총리뷰수"] = visitor + blog
+        blog_this_month = count_month_reviews(
+            blog_dates,
+            this_year,
+            this_month
+        )
 
-            if visitor > 0 or blog > 0:
-                result["조회상태"] = "성공"
-            else:
-                result["조회상태"] = "리뷰 미검출"
-
-            return result
+        blog_prev_month = count_month_reviews(
+            blog_dates,
+            prev_year,
+            prev_month
+        )
 
     except Exception as e:
-        result["조회상태"] = f"오류: {str(e)[:120]}"
-        return result
+        print("수집 실패:", e)
+
+    finally:
+        driver.quit()
+
+    return {
+        "방문자 리뷰": visitor_total,
+        "블로그 리뷰": blog_total,
+        "총 리뷰": visitor_total + blog_total,
+        "이번달 방문자": visitor_this_month,
+        "이번달 블로그": blog_this_month,
+        "저번달 방문자": visitor_prev_month,
+        "저번달 블로그": blog_prev_month,
+    }
 
 
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def load_review_data(hospitals):
-    rows = []
+today = datetime.now()
+today_label = f"{today.month}월 {today.day}일"
+this_month_label = f"{today.month}월"
 
-    for hospital in hospitals:
-        rows.append(get_naver_place_review_data(hospital))
+data = []
 
-    df = pd.DataFrame(rows)
+with st.spinner("네이버 플레이스 데이터를 조회중입니다..."):
+    for name, url in hospital_urls.items():
+        result = get_naver_place_data(url)
 
-    df["총리뷰수"] = df["방문자리뷰"] + df["블로그리뷰"]
-
-    df["방문자비율"] = df.apply(
-        lambda row: round(row["방문자리뷰"] / row["총리뷰수"] * 100, 1)
-        if row["총리뷰수"] > 0 else 0,
-        axis=1,
-    )
-
-    df = df.sort_values("총리뷰수", ascending=False).reset_index(drop=True)
-    df["순위"] = df.index + 1
-
-    return df
+        data.append({
+            "병원명": name,
+            "방문자 리뷰": result["방문자 리뷰"],
+            "블로그 리뷰": result["블로그 리뷰"],
+            "총 리뷰": result["총 리뷰"],
+            "이번달 방문자": result["이번달 방문자"],
+            "이번달 블로그": result["이번달 블로그"],
+            "저번달 방문자": result["저번달 방문자"],
+            "저번달 블로그": result["저번달 블로그"],
+        })
 
 
-# ======================================================
-# APP
-# ======================================================
+df = pd.DataFrame(data)
+df = df.sort_values("총 리뷰", ascending=False)
 
-init_db()
+main = df[df["병원명"] == main_hospital].iloc[0]
 
-st.sidebar.title("설정")
+this_month_visitor = int(main["이번달 방문자"])
+this_month_blog = int(main["이번달 블로그"])
+this_month_total = this_month_visitor + this_month_blog
 
-main_hospital = st.sidebar.selectbox(
-    "대표 병원",
-    [h["name"] for h in HOSPITALS],
-    index=[h["name"] for h in HOSPITALS].index(MAIN_HOSPITAL),
-)
+prev_month_visitor = int(main["저번달 방문자"])
+prev_month_blog = int(main["저번달 블로그"])
+prev_month_total = prev_month_visitor + prev_month_blog
 
-save_history_enabled = st.sidebar.checkbox(
-    "이번 조회 결과를 히스토리에 저장",
-    value=True,
-)
-
-if st.sidebar.button("데이터 새로고침"):
-    st.cache_data.clear()
-    st.rerun()
+trend_total = this_month_total - prev_month_total
+trend_visitor = this_month_visitor - prev_month_visitor
+trend_blog = this_month_blog - prev_month_blog
 
 
 st.markdown(f"""
-<div>
-    <div class="badge">Live Naver Place Review Dashboard</div>
-    <div class="main-title">{main_hospital} 리뷰 대시보드</div>
-    <div class="main-sub">
-        등록된 네이버 플레이스 URL을 직접 조회하고, 조회 시점별 데이터를 저장해 일/주/월 증감 추이를 계산합니다.
-    </div>
+<div class="main-title">하루한의원 리뷰 눈팅</div>
+<div class="main-sub">
+네이버 플레이스 리뷰 기반 실시간 모니터링 · 기준일 {today_label}
 </div>
 """, unsafe_allow_html=True)
 
 
-with st.spinner("네이버 플레이스 리뷰 데이터를 조회하는 중입니다..."):
-    df = load_review_data(HOSPITALS)
+col1, col2, col3 = st.columns(3)
 
-if df.empty:
-    st.error("조회된 데이터가 없습니다.")
-    st.stop()
-
-if save_history_enabled:
-    for _, row in df.iterrows():
-        if row["조회상태"] == "성공":
-            save_snapshot(row)
-
-main_df = df[df["병원명"] == main_hospital]
-
-if main_df.empty:
-    st.error("대표 병원 데이터가 없습니다.")
-    st.stop()
-
-main_data = main_df.iloc[0]
-main_rank = int(main_data["순위"])
-top_data = df.iloc[0]
-
-review_gap = int(top_data["총리뷰수"] - main_data["총리뷰수"])
-avg_total = df["총리뷰수"].mean()
-success_count = len(df[df["조회상태"] == "성공"])
-
-history_df = load_history(main_hospital)
-
-daily_delta = calc_delta(history_df, int(main_data["총리뷰수"]), 1)
-weekly_delta = calc_delta(history_df, int(main_data["총리뷰수"]), 7)
-monthly_delta = calc_delta(history_df, int(main_data["총리뷰수"]), 30)
-
-
-# ======================================================
-# KPI
-# ======================================================
-
-col1, col2, col3, col4, col5 = st.columns(5)
-
-kpis = [
-    ("총 리뷰", f"{int(main_data['총리뷰수']):,}개", "방문자 + 블로그 리뷰"),
-    ("방문자 리뷰", f"{int(main_data['방문자리뷰']):,}개", "네이버 방문자 리뷰"),
-    ("블로그 리뷰", f"{int(main_data['블로그리뷰']):,}개", "네이버 블로그 리뷰"),
-    ("리뷰 순위", f"{main_rank}위", "비교군 내 리뷰 수 기준"),
-    ("조회 성공", f"{success_count}/{len(df)}", "데이터 수집 상태"),
-]
-
-for col, item in zip([col1, col2, col3, col4, col5], kpis):
-    with col:
-        st.markdown(f"""
-        <div class="kpi-card">
-            <div class="kpi-label">{item[0]}</div>
-            <div class="kpi-value">{item[1]}</div>
-            <div class="kpi-help">{item[2]}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-# ======================================================
-# DELTA KPI
-# ======================================================
-
-st.markdown('<div class="section-title">리뷰 증감 추이</div>', unsafe_allow_html=True)
-
-d1, d2, d3 = st.columns(3)
-
-delta_kpis = [
-    ("일간 증감", format_delta(daily_delta), "약 24시간 전 대비"),
-    ("주간 증감", format_delta(weekly_delta), "약 7일 전 대비"),
-    ("월간 증감", format_delta(monthly_delta), "약 30일 전 대비"),
-]
-
-for col, item in zip([d1, d2, d3], delta_kpis):
-    with col:
-        st.markdown(f"""
-        <div class="kpi-card">
-            <div class="kpi-label">{item[0]}</div>
-            <div class="kpi-value">{item[1]}</div>
-            <div class="kpi-help">{item[2]}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-# ======================================================
-# HISTORY CHART
-# ======================================================
-
-if not history_df.empty and len(history_df) >= 2:
-    st.markdown(f'<div class="section-title">{main_hospital} 누적 리뷰 추이</div>', unsafe_allow_html=True)
-
-    fig_history = px.line(
-        history_df,
-        x="collected_at",
-        y="total_reviews",
-        markers=True,
-        text="total_reviews",
+with col1:
+    kpi_card(
+        "총 리뷰",
+        f"{int(main['총 리뷰']):,}개",
+        "방문자 + 블로그 리뷰"
     )
 
-    fig_history.update_traces(
-        line=dict(color="#60a5fa", width=4),
-        marker=dict(size=8, color="#bfdbfe"),
-        textposition="top center",
+with col2:
+    kpi_card(
+        "방문자 리뷰",
+        f"{int(main['방문자 리뷰']):,}개",
+        "네이버 방문 인증 리뷰"
     )
 
-    fig_history.update_layout(
-        height=380,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#d1d5db", size=13),
-        margin=dict(l=10, r=20, t=10, b=10),
-        xaxis=dict(title="", gridcolor="rgba(255,255,255,.06)"),
-        yaxis=dict(title="누적 리뷰 수", gridcolor="rgba(255,255,255,.06)"),
+with col3:
+    kpi_card(
+        "블로그 리뷰",
+        f"{int(main['블로그 리뷰']):,}개",
+        "네이버 블로그 후기"
     )
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.plotly_chart(fig_history, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-else:
-    st.info("일/주/월 추이는 데이터가 쌓여야 정확히 표시됩니다. 오늘부터 조회 기록이 저장됩니다.")
 
+st.markdown(
+    '<div class="section-title">신규 리뷰 트렌드</div>',
+    unsafe_allow_html=True
+)
 
-# ======================================================
-# COMPARE + INSIGHT
-# ======================================================
+k1, k2 = st.columns(2)
 
-left, right = st.columns([1.35, 1])
-
-with left:
-    st.markdown('<div class="section-title">경쟁 병원 리뷰 비교</div>', unsafe_allow_html=True)
-
-    chart_df = df.sort_values("총리뷰수", ascending=True)
-
-    fig = px.bar(
-        chart_df,
-        x="총리뷰수",
-        y="병원명",
-        orientation="h",
-        text="총리뷰수",
+with k1:
+    kpi_card(
+        "월간 신규 리뷰",
+        f"+{this_month_total}개",
+        f"{this_month_label} 작성일 기준<br>"
+        f"방문자 +{this_month_visitor}개 · 블로그 +{this_month_blog}개"
     )
 
-    colors = [
-        "#60a5fa" if name == main_hospital else "rgba(156,163,175,.45)"
-        for name in chart_df["병원명"]
+with k2:
+    kpi_card(
+        "증감 추이",
+        f"{trend_total:+}개",
+        f"이번달 - 저번달<br>"
+        f"방문자 {trend_visitor:+}개 · 블로그 {trend_blog:+}개"
+    )
+
+
+st.markdown(
+    '<div class="section-title">주변 병원 리뷰 비교</div>',
+    unsafe_allow_html=True
+)
+
+bar_fig = px.bar(
+    df,
+    x="병원명",
+    y="총 리뷰"
+)
+
+bar_fig.update_traces(
+    marker_color=[
+        "#60a5fa" if x == main_hospital else "#374151"
+        for x in df["병원명"]
     ]
+)
 
-    fig.update_traces(
-        marker_color=colors,
-        texttemplate="%{text:,}개",
-        textposition="outside",
-    )
+bar_fig.update_layout(
+    plot_bgcolor="#171b26",
+    paper_bgcolor="#171b26",
+    font=dict(color="white"),
+    xaxis_title="",
+    yaxis_title="리뷰 수",
+    xaxis=dict(showgrid=False),
+    yaxis=dict(gridcolor="#2b3240")
+)
 
-    fig.update_layout(
-        height=430,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#d1d5db", size=13),
-        margin=dict(l=10, r=50, t=10, b=10),
-        xaxis=dict(title="", gridcolor="rgba(255,255,255,.06)"),
-        yaxis=dict(title=""),
-    )
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.plotly_chart(fig, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with right:
-    st.markdown('<div class="section-title">마케팅 인사이트</div>', unsafe_allow_html=True)
-
-    if review_gap > 0:
-        gap_text = f"현재 1위는 <b>{top_data['병원명']}</b>이며, {main_hospital}과의 리뷰 격차는 <b>{review_gap:,}개</b>입니다."
-    else:
-        gap_text = f"현재 {main_hospital}이 비교군 내 리뷰 수 기준 <b>1위</b>입니다."
-
-    if main_data["총리뷰수"] >= avg_total:
-        avg_text = f"비교군 평균 리뷰 수 <b>{avg_total:,.0f}개</b>보다 높은 수준입니다."
-    else:
-        avg_text = f"비교군 평균 리뷰 수 <b>{avg_total:,.0f}개</b>보다 낮은 수준입니다."
-
-    st.markdown(f"""
-    <div class="insight-card">
-        <div class="insight-title">현재 상태 요약</div>
-        <div class="insight-text">
-            {main_hospital}의 현재 리뷰 순위는 <b>{main_rank}위</b>입니다.<br><br>
-            {gap_text}<br><br>
-            {avg_text}<br><br>
-            일간 증감: <b>{format_delta(daily_delta)}</b><br>
-            주간 증감: <b>{format_delta(weekly_delta)}</b><br>
-            월간 증감: <b>{format_delta(monthly_delta)}</b><br><br>
-            마지막 조회 시간은 <b>{main_data['조회시간']}</b>입니다.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ======================================================
-# TABLES
-# ======================================================
-
-st.markdown('<div class="section-title">실시간 조회 데이터</div>', unsafe_allow_html=True)
-
-display_df = df[
-    [
-        "순위",
-        "병원명",
-        "방문자리뷰",
-        "블로그리뷰",
-        "총리뷰수",
-        "방문자비율",
-        "조회상태",
-        "조회시간",
-        "입력URL",
-        "플레이스URL",
-    ]
-].copy()
-
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.dataframe(display_df, use_container_width=True, hide_index=True)
+st.markdown('<div class="content-card">', unsafe_allow_html=True)
+st.plotly_chart(bar_fig, use_container_width=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
 
-if not history_df.empty:
-    st.markdown('<div class="section-title">저장된 히스토리</div>', unsafe_allow_html=True)
-
-    show_history = history_df.rename(columns={
-        "hospital_name": "병원명",
-        "visitor_reviews": "방문자리뷰",
-        "blog_reviews": "블로그리뷰",
-        "total_reviews": "총리뷰수",
-        "status": "조회상태",
-        "place_url": "플레이스URL",
-        "collected_at": "수집시간",
-    })
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.dataframe(
-        show_history.sort_values("수집시간", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-st.caption(
-    "주의: 일/주/월 증감은 네이버가 과거 데이터를 제공하는 것이 아니라, "
-    "이 앱이 조회 시점마다 저장한 스냅샷을 기준으로 계산합니다. "
-    "처음 실행한 날에는 기록 부족으로 표시될 수 있습니다."
+st.markdown(
+    '<div class="section-title">전체 병원 데이터</div>',
+    unsafe_allow_html=True
 )
+
+st.markdown('<div class="content-card">', unsafe_allow_html=True)
+st.dataframe(df, use_container_width=True, hide_index=True)
+st.markdown('</div>', unsafe_allow_html=True)
